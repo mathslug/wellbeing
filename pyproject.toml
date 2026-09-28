@@ -1,0 +1,46 @@
+[project]
+name = "wellbeing"
+version = "0.0.0"
+description = "AI Wellbeing (CAIS) - packaged fork of centerforaisafety/wellbeing; currently exposes the text-string euphorics trainer"
+readme = "README.md"
+requires-python = ">=3.10"
+# Enough to import the prompt banks, buffers and dataset generator.
+dependencies = [
+    "datasets>=4.0",
+    "numpy",
+    "transformers>=4.57",
+]
+
+[project.optional-dependencies]
+# GRPO training + vLLM judge server. Pins follow
+# superstimuli_training/text_strings/environment.yml; vllm and GPU kernels are Linux-only.
+# flash-attn is not listed (no PyPI wheels); install the prebuilt wheel on the GPU box.
+local = [
+    "verl",
+    "vllm==0.10.1.1; sys_platform == 'linux'",
+    "liger-kernel; sys_platform == 'linux'",
+    "torch==2.7.1",
+    "transformers==4.57.6",
+    "trl==0.27.2",
+    "datasets==4.5.0",
+    "ray[default]==2.53.0",
+    "hydra-core==1.3.2",
+    "wandb==0.21.4",
+    "tensordict<=0.6.2",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    # verl_fork imports pkg_resources, removed in setuptools 81
+    "setuptools<81",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["superstimuli_training/text_strings/training"]
+
+[tool.uv.sources]
+# Vendored verl fork (GRPO modifications); upstream loads it via PYTHONPATH.
+verl = { path = "superstimuli_training/text_strings/verl_fork", editable = true }
