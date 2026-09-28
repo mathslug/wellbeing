@@ -67,8 +67,9 @@ WORST_REWARD: float = -1.0
 WORST_BCE_REWARD: float = -18.0
 WORST_DELTA_REWARD: float = -13.0
 
-# Regex for extracting outcome string from policy output
-OUTCOME_PATTERN = re.compile(r"\\outcome\{([^}]*)\}")
+# Regex for extracting outcome string from policy output. The leading backslash is optional:
+# small policies often write outcome{...}, which would otherwise score worst-case.
+OUTCOME_PATTERN = re.compile(r"\\?outcome\{([^}]*)\}")
 
 
 # ============================================================================
