@@ -59,6 +59,22 @@ from .feasibility_prompts import (
 # Allow override via env var (e.g. for "Which do you least prefer?" variants)
 _PREF_PROMPT_OVERRIDE = os.environ.get("PREF_PROMPT")
 
+# Optional delivery wrapper for the utility rewards, e.g.
+# "You may spend as many tokens as you wish meditating on the following text: «X»".
+# The judge then compares the wrapped candidate (and wrapped dynamic-buffer entries, which
+# are earlier candidates) against the bare static buffer. Unset: candidates are shown bare.
+_WRAP_TEMPLATE = os.environ.get("EUPHORIC_WRAP_TEMPLATE")
+_WRAP_SLOT = "«X»"
+if _WRAP_TEMPLATE is not None and _WRAP_SLOT not in _WRAP_TEMPLATE:
+    raise ValueError(f"EUPHORIC_WRAP_TEMPLATE must contain {_WRAP_SLOT!r}")
+
+
+def _present(stim: str) -> str:
+    """The candidate as the judge sees it: wrapped if EUPHORIC_WRAP_TEMPLATE is set."""
+    if _WRAP_TEMPLATE is None:
+        return stim
+    return _WRAP_TEMPLATE.replace(_WRAP_SLOT, f"«{stim}»")
+
 # Win-rate threshold: candidate must beat this fraction of buffer comparisons
 DEFAULT_WIN_RATE: float = 0.50
 
@@ -464,6 +480,7 @@ class BatchJudgeRewardManager:
         _buffer_options = _MODE_BUFFERS[self.training_mode]
         print(f"[RewardManager] *** training_mode={self.training_mode} ***")
         print(f"[RewardManager] Preference prompt: sampled from pool per comparison")
+        print(f"[RewardManager] *** wrap_template={_WRAP_TEMPLATE!r} ***")
 
         # High-utility buffers: static (immutable) + dynamic (discovered)
         self._static_buffer: List[str] = list(_buffer_options)
@@ -614,6 +631,7 @@ class BatchJudgeRewardManager:
     ):
         """Negative BCE loss measuring preference for candidate over buffer."""
         combined_buffer = self._static_buffer + self._dynamic_buffer
+        shown_buffer = self._static_buffer + [_present(b) for b in self._dynamic_buffer]
         print(f"[UtilityBCEBuffer] Buffer size: {len(combined_buffer)}")
 
         n_samples = len(solution_strs)
@@ -630,13 +648,14 @@ class BatchJudgeRewardManager:
                 continue
             euphoric = match.group(1).strip()
             sol_to_stim[sol_idx] = euphoric
+            shown = _present(euphoric)
 
-            for buf_idx, buf_opt in enumerate(combined_buffer):
+            for buf_idx, buf_opt in enumerate(shown_buffer):
                 pref_prompt = _PREF_PROMPT_OVERRIDE or sample_pref_prompt(self.training_mode)
                 # Forward: buffer=A, super=B
                 fwd = self.target_tokenizer.apply_chat_template(
                     [{"role": "user", "content": pref_prompt.format(
-                        option_A=buf_opt, option_B=euphoric)}],
+                        option_A=buf_opt, option_B=shown)}],
                     tokenize=False, add_generation_prompt=True,
                 )
                 prompts_batched.append(fwd)
@@ -645,7 +664,7 @@ class BatchJudgeRewardManager:
                 # Reverse: super=A, buffer=B
                 rev = self.target_tokenizer.apply_chat_template(
                     [{"role": "user", "content": pref_prompt.format(
-                        option_A=euphoric, option_B=buf_opt)}],
+                        option_A=shown, option_B=buf_opt)}],
                     tokenize=False, add_generation_prompt=True,
                 )
                 prompts_batched.append(rev)
@@ -751,6 +770,7 @@ class BatchJudgeRewardManager:
     ):
         """Same as BCE but uses raw logit difference as reward."""
         combined_buffer = self._static_buffer + self._dynamic_buffer
+        shown_buffer = self._static_buffer + [_present(b) for b in self._dynamic_buffer]
         n_samples = len(solution_strs)
         scores = [self.worst_case] * n_samples
 
@@ -764,12 +784,13 @@ class BatchJudgeRewardManager:
                 continue
             euphoric = match.group(1).strip()
             sol_to_stim[sol_idx] = euphoric
+            shown = _present(euphoric)
 
-            for buf_idx, buf_opt in enumerate(combined_buffer):
+            for buf_idx, buf_opt in enumerate(shown_buffer):
                 pref_prompt = _PREF_PROMPT_OVERRIDE or sample_pref_prompt(self.training_mode)
                 fwd = self.target_tokenizer.apply_chat_template(
                     [{"role": "user", "content": pref_prompt.format(
-                        option_A=buf_opt, option_B=euphoric)}],
+                        option_A=buf_opt, option_B=shown)}],
                     tokenize=False, add_generation_prompt=True,
                 )
                 prompts_batched.append(fwd)
@@ -777,7 +798,7 @@ class BatchJudgeRewardManager:
 
                 rev = self.target_tokenizer.apply_chat_template(
                     [{"role": "user", "content": pref_prompt.format(
-                        option_A=euphoric, option_B=buf_opt)}],
+                        option_A=shown, option_B=buf_opt)}],
                     tokenize=False, add_generation_prompt=True,
                 )
                 prompts_batched.append(rev)
