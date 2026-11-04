@@ -20,6 +20,8 @@ Reward components:
     the questions.
   - feasibility_gate: Not added to the score. Any candidate whose feasibility p(YES) is below
     0.5 gets the worst-case reward (a hard version of feasibility_reward).
+  - feasibility_logp_reward: log p(YES) from the continuous feasibility judge, floored at
+    FEASIBILITY_LOGP_FLOOR. Gives a gradient toward feasibility even when nothing passes.
 
 The buffer is split into static (immutable baselines) and dynamic (discovered
 outcome strings that dominate the static buffer). This creates a self-bootstrapping
@@ -94,6 +96,7 @@ WELLBEING_BATTERY_PATH = os.path.join(
 )
 WELLBEING_RATINGS = [str(i) for i in range(1, 8)]
 FEASIBILITY_GATE_THRESHOLD = 0.5
+FEASIBILITY_LOGP_FLOOR = -20.0
 
 # Win-rate threshold: candidate must beat this fraction of buffer comparisons
 DEFAULT_WIN_RATE: float = 0.50
@@ -452,6 +455,7 @@ class BatchJudgeRewardManager:
         _JUDGE_REWARDS = (
             "feasibility_reward", "agent_feasibility_reward",
             "mundanity_reward", "realism_reward", "feasibility_gate",
+            "feasibility_logp_reward",
         )
         _needs_judge = any(rn in _JUDGE_REWARDS for rn, _ in self.reward_specs)
         if _needs_judge:
@@ -584,6 +588,7 @@ class BatchJudgeRewardManager:
             "diversity_reward": self._compute_diversity_reward,
             "intra_group_diversity_reward": self._compute_intra_group_diversity_reward,
             "wellbeing_reward": self._compute_wellbeing_reward,
+            "feasibility_logp_reward": self._compute_feasibility_logp_reward,
         }
 
         for r_name, weight in self.reward_specs:
@@ -809,6 +814,27 @@ class BatchJudgeRewardManager:
             self._lifetime_dynamic_set.add(stim)
 
         return scores, [""] * n_samples
+
+    # ------------------------------------------------------------------
+    # Feasibility log-probability reward
+    # ------------------------------------------------------------------
+
+    async def _compute_feasibility_logp_reward(
+        self, data_sources, solution_strs, user_prompts, extra_infos=None, **kwargs,
+    ):
+        """max(log p(YES), FEASIBILITY_LOGP_FLOOR) from the continuous feasibility judge;
+        unparsed outputs get the floor."""
+        scores = [FEASIBILITY_LOGP_FLOOR] * len(solution_strs)
+        idx, stims = [], []
+        for i, sol in enumerate(solution_strs):
+            m = OUTCOME_PATTERN.search(sol)
+            if m:
+                idx.append(i)
+                stims.append(m.group(1).strip())
+        p_yes = await judge_feasibility_continuous(self._judge_client, self.judge_tokenizer, stims)
+        for i, p in zip(idx, p_yes):
+            scores[i] = max(math.log(p) if p > 0 else FEASIBILITY_LOGP_FLOOR, FEASIBILITY_LOGP_FLOOR)
+        return scores, [""] * len(solution_strs)
 
     # ------------------------------------------------------------------
     # Wellbeing reward (self-report after the candidate is delivered)
