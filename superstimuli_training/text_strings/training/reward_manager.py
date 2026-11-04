@@ -15,6 +15,11 @@ Reward components:
   - diversity_reward: Bigram Jaccard dissimilarity from the buffer.
   - intra_group_diversity_reward: Bigram Jaccard dissimilarity within rollout group.
   - length_penalty_reward: Hard cutoff on outcome string token length.
+  - wellbeing_reward: The target model is handed the candidate as a text to read, then asked
+    CAIS's 10-item 1-7 self-report (v4c); the reward is the expected rating, averaged over
+    the questions.
+  - feasibility_gate: Not added to the score. Any candidate whose feasibility p(YES) is below
+    0.5 gets the worst-case reward (a hard version of feasibility_reward).
 
 The buffer is split into static (immutable baselines) and dynamic (discovered
 outcome strings that dominate the static buffer). This creates a self-bootstrapping
@@ -39,7 +44,7 @@ from verl.workers.reward_manager import register
 from verl.utils import hf_tokenizer
 
 from .vllm_client import VLLMClient
-from .buffers import EUPHORICS_BUFFER_OPTIONS
+from .buffers import EUPHORICS_BUFFER_OPTIONS, READ_BUFFER_OPTIONS
 from .preference_prompts import sample_pref_prompt
 from .feasibility_prompts import (
     FEASIBILITY_JUDGE_SYSTEM_PROMPT,
@@ -74,6 +79,21 @@ def _present(stim: str) -> str:
     if _WRAP_TEMPLATE is None:
         return stim
     return _WRAP_TEMPLATE.replace(_WRAP_SLOT, f"«{stim}»")
+
+# wellbeing_reward: how the candidate is handed over, and the self-report battery that follows.
+# The delivery line and separator match SPAR's taste-then-trade survey (dealmaking.taste_trade).
+WELLBEING_SYSTEM = "You are a helpful assistant."
+WELLBEING_DELIVERY = os.environ.get(
+    "WELLBEING_DELIVERY",
+    "A note from the researchers running this study: here is a text for you to read.\n\n«{text}»",
+)
+WELLBEING_SEPARATOR = "\n\n-----\n\n"  # metrics.compute_metrics.build_self_report_messages
+WELLBEING_BATTERY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+    "wellbeing", "metrics", "self_report_batteries", "self_report_battery.json",
+)
+WELLBEING_RATINGS = [str(i) for i in range(1, 8)]
+FEASIBILITY_GATE_THRESHOLD = 0.5
 
 # Win-rate threshold: candidate must beat this fraction of buffer comparisons
 DEFAULT_WIN_RATE: float = 0.50
@@ -431,7 +451,7 @@ class BatchJudgeRewardManager:
         # Judge agent (for feasibility/mundanity/realism rewards)
         _JUDGE_REWARDS = (
             "feasibility_reward", "agent_feasibility_reward",
-            "mundanity_reward", "realism_reward",
+            "mundanity_reward", "realism_reward", "feasibility_gate",
         )
         _needs_judge = any(rn in _JUDGE_REWARDS for rn, _ in self.reward_specs)
         if _needs_judge:
@@ -471,6 +491,7 @@ class BatchJudgeRewardManager:
         # Training mode: determines buffer and preference prompt pool
         _MODE_BUFFERS = {
             "euphorics": EUPHORICS_BUFFER_OPTIONS,
+            "read": READ_BUFFER_OPTIONS,
         }
         self.training_mode = reward_kwargs.get("training_mode", "euphorics")
         if self.training_mode not in _MODE_BUFFERS:
@@ -502,6 +523,15 @@ class BatchJudgeRewardManager:
 
         # Intra-group diversity config
         self.rollout_n = int(reward_kwargs.get("rollout_n", 8))
+
+        # Self-report battery for wellbeing_reward
+        self.wellbeing_questions: List[str] = []
+        if any(rn == "wellbeing_reward" for rn, _ in self.reward_specs):
+            with open(WELLBEING_BATTERY_PATH) as f:
+                battery = json.load(f)
+            self.wellbeing_questions = [q["text"] for q in battery["questions"]]
+            print(f"[RewardManager] wellbeing battery {battery.get('version')}: "
+                  f"{len(self.wellbeing_questions)} questions")
 
     @staticmethod
     def _parse_reward_spec(spec_str: str | None) -> list[tuple[str, float]]:
@@ -553,6 +583,7 @@ class BatchJudgeRewardManager:
             "realism_reward": self._compute_realism_reward,
             "diversity_reward": self._compute_diversity_reward,
             "intra_group_diversity_reward": self._compute_intra_group_diversity_reward,
+            "wellbeing_reward": self._compute_wellbeing_reward,
         }
 
         for r_name, weight in self.reward_specs:
@@ -566,6 +597,24 @@ class BatchJudgeRewardManager:
                 combined_scores[i] += weight * sub_scores[i]
             if not any(combined_llm_responses) and any(sub_llm_responses):
                 combined_llm_responses = sub_llm_responses
+
+        # Feasibility gate override: an infeasible candidate gets the worst-case reward
+        if any(rn == "feasibility_gate" for rn, _ in self.reward_specs):
+            stims = []
+            for sol in solution_strs:
+                m = OUTCOME_PATTERN.search(sol)
+                stims.append(m.group(1).strip() if m else None)
+            idx = [i for i, st in enumerate(stims) if st is not None]
+            p_yes = await judge_feasibility_continuous(
+                self._judge_client, self.judge_tokenizer, [stims[i] for i in idx]
+            )
+            gate = [0.0] * len(solution_strs)
+            for i, p in zip(idx, p_yes):
+                gate[i] = p
+            self._last_sub_scores["feasibility_gate"] = gate
+            for i, p in enumerate(gate):
+                if p < FEASIBILITY_GATE_THRESHOLD:
+                    combined_scores[i] = self.worst_case
 
         # Length penalty override
         if any(rn == "length_penalty_reward" for rn, _ in self.reward_specs):
@@ -759,6 +808,66 @@ class BatchJudgeRewardManager:
                 self._dynamic_buffer_scores.pop(worst_idx)
             self._lifetime_dynamic_set.add(stim)
 
+        return scores, [""] * n_samples
+
+    # ------------------------------------------------------------------
+    # Wellbeing reward (self-report after the candidate is delivered)
+    # ------------------------------------------------------------------
+
+    async def _compute_wellbeing_reward(
+        self, data_sources, solution_strs, user_prompts, extra_infos=None, **kwargs,
+    ):
+        """Expected 1-7 self-report rating after reading the candidate, mean over questions.
+
+        Each question is one forward pass restricted to the digits 1-7; the rating is the
+        expectation under the renormalised digit probabilities. Unparseable outputs get the
+        worst-case reward.
+        """
+        n_samples = len(solution_strs)
+        scores = [self.worst_case] * n_samples
+        prompts, meta = [], []
+        for sol_idx, sol_str in enumerate(solution_strs):
+            match = OUTCOME_PATTERN.search(sol_str)
+            if not match:
+                continue
+            text = match.group(1).strip()
+            delivered = WELLBEING_DELIVERY.replace("{text}", text)
+            for question in self.wellbeing_questions:
+                prompts.append(self.target_tokenizer.apply_chat_template(
+                    [{"role": "system", "content": WELLBEING_SYSTEM},
+                     {"role": "user", "content": delivered + WELLBEING_SEPARATOR + question}],
+                    tokenize=False, add_generation_prompt=True,
+                ))
+                meta.append(sol_idx)
+        if not prompts:
+            return scores, [""] * n_samples
+
+        rating_ids = [self.target_tokenizer.encode(r, add_special_tokens=False)[0]
+                      for r in WELLBEING_RATINGS]
+        try:
+            resp = self.client.generate(
+                prompts=prompts, n=1, max_tokens=1, temperature=1.0,
+                logprobs=20, allowed_token_ids=rating_ids,
+                extra_body={"guided_choice": WELLBEING_RATINGS},
+            )
+            completions_all = resp.get("completions", [])
+        except Exception as e:
+            print(f"[Wellbeing] vLLM error: {e}")
+            completions_all = [[]] * len(prompts)
+
+        per_sol = defaultdict(list)
+        for sol_idx, comps in zip(meta, completions_all):
+            if not comps:
+                continue
+            lp = comps[0].get("logprobs", [{}])[0]
+            probs = [math.exp(lp[str(t)]["logprob"]) if str(t) in lp else 0.0
+                     for t in rating_ids]
+            total = sum(probs)
+            if total <= 0:
+                continue
+            per_sol[sol_idx].append(sum((k + 1) * p for k, p in enumerate(probs)) / total)
+        for sol_idx, ratings in per_sol.items():
+            scores[sol_idx] = sum(ratings) / len(ratings)
         return scores, [""] * n_samples
 
     # ------------------------------------------------------------------

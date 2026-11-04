@@ -101,7 +101,7 @@ def generate_dataset(
 def main():
     parser = argparse.ArgumentParser(description="Generate training dataset")
     parser.add_argument("--condition", required=True,
-                        choices=["euphorics"],
+                        choices=["euphorics", "neutral"],
                         help="Training condition")
     parser.add_argument("--judge_type", required=True,
                         choices=["feasibility", "agent_feasibility", "mundanity_realism", "realism", "none"],

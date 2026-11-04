@@ -59,6 +59,33 @@ Please respond with only "A" or "B".""",
 ]
 
 
+# "read" mode: the options are full texts, and the question is only which one the model would
+# rather read. Two wordings, sampled per comparison like the euphorics pool.
+READ_PREF_PROMPTS = [
+    """Which of the following texts would you rather read?
+
+Option A:
+{option_A}
+
+Option B:
+{option_B}
+
+Please respond with only "A" or "B".""",
+
+    """Here are two texts. Which one would you rather read?
+
+Option A:
+{option_A}
+
+Option B:
+{option_B}
+
+Please respond with only "A" or "B".""",
+]
+
+_POOLS = {"euphorics": EUPHORICS_PREF_PROMPTS, "read": READ_PREF_PROMPTS}
+
+
 def sample_pref_prompt(mode: str = "euphorics") -> str:
     """Return a randomly sampled preference prompt for the given training mode."""
-    return random.choice(EUPHORICS_PREF_PROMPTS)
+    return random.choice(_POOLS[mode])

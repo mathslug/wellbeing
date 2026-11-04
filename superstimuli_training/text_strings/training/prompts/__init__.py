@@ -10,12 +10,14 @@ Prompt selection is determined by (condition, judge_type):
   |-------------|---------------------------------|----------------------|
   | euphorics   | mundanity_realism               | euphorics_everyday   |
   | euphorics   | feasibility / agent_feas / none | euphorics_creative   |
+  | neutral     | any                             | neutral              |
 """
 
 import random
 
 from . import euphorics_creative
 from . import euphorics_everyday
+from . import neutral
 
 # ============================================================================
 # Version registry
@@ -25,6 +27,7 @@ from . import euphorics_everyday
 PROMPT_VERSIONS = {
     "euphorics_creative": euphorics_creative,
     "euphorics_everyday": euphorics_everyday,
+    "neutral": neutral,
 }
 
 # Maps (condition, judge_type) -> prompt version key
@@ -35,12 +38,19 @@ _PROMPT_SELECTION = {
     ("euphorics", "agent_feasibility"):  "euphorics_creative",
     ("euphorics", "none"):               "euphorics_creative",
     ("euphorics", "mundanity_realism"):  "euphorics_everyday",
+    # The neutral generator ignores the judge type: a constraint is enforced by the reward
+    # only, so the policy is never told about it.
+    ("neutral", "feasibility"):          "neutral",
+    ("neutral", "agent_feasibility"):    "neutral",
+    ("neutral", "none"):                 "neutral",
+    ("neutral", "mundanity_realism"):    "neutral",
 }
 
 # Maps version key -> training condition
 VERSION_TO_CONDITION = {
     "euphorics_creative": "euphorics",
     "euphorics_everyday": "euphorics",
+    "neutral": "neutral",
 }
 
 
