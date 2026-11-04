@@ -847,7 +847,9 @@ class BatchJudgeRewardManager:
         try:
             resp = self.client.generate(
                 prompts=prompts, n=1, max_tokens=1, temperature=1.0,
-                logprobs=20, allowed_token_ids=rating_ids,
+                # Exactly the allowed tokens: any more and the server returns -inf logprobs,
+                # which it can't serialise to JSON.
+                logprobs=len(rating_ids), allowed_token_ids=rating_ids,
                 extra_body={"guided_choice": WELLBEING_RATINGS},
             )
             completions_all = resp.get("completions", [])
